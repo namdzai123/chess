@@ -1,0 +1,240 @@
+// ==UserScript==
+// @name         Chess.com Bot Practice Helper v2
+// @namespace    local.chess.helper
+// @version      2.1
+// @description  Gợi ý nước đi mạnh bằng Stockfish (hoạt động ở mọi chế độ)
+// @match        https://www.chess.com/*
+// @grant        GM_xmlhttpRequest
+// @connect      cdnjs.cloudflare.com
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  const SF_URL = 'https://cdnjs.cloudflare.com/ajax/libs/stockfish.js/10.0.2/stockfish.js';
+  const COLORS = ['#3498db', '#2ecc71', '#f39c12'];
+
+  let enabled = false, depth = 16, multiPV = 3;
+  let engine = null, ready = false;
+  let lastFen = '', timer = null;
+  let pending = 0;          // số lệnh "go" chưa nhận bestmove
+  let lines = {};           // kết quả theo multipv
+
+  // ---------- Giao diện ----------
+  const panel = document.createElement('div');
+  panel.style.cssText = 'position:fixed;top:70px;right:12px;z-index:99999;background:#262421;color:#fff;font:13px sans-serif;padding:10px;border-radius:8px;width:210px;box-shadow:0 2px 8px #0008;';
+  panel.innerHTML = `
+    <button id="ch-toggle" style="width:100%;padding:6px;border:0;border-radius:5px;background:#c33;color:#fff;font-weight:bold;cursor:pointer">TẮT</button>
+    <div style="margin-top:8px">Độ sâu: <b id="ch-dv">${depth}</b>
+      <input id="ch-depth" type="range" min="1" max="24" value="${depth}" style="width:100%"></div>
+    <div style="margin-top:4px">Số nước gợi ý: <b id="ch-mv">${multiPV}</b>
+      <input id="ch-multi" type="range" min="1" max="3" value="${multiPV}" style="width:100%"></div>
+    <div id="ch-eval" style="margin-top:6px;font-size:18px;font-weight:bold;text-align:center">–</div>
+    <div id="ch-lines" style="margin-top:4px;font:11px monospace;color:#ccc;line-height:1.4"></div>
+    <div id="ch-info" style="margin-top:6px;color:#9f9">Sẵn sàng</div>`;
+  document.body.appendChild(panel);
+
+  const $ = (s) => panel.querySelector(s);
+  const info = (t) => ($('#ch-info').textContent = t);
+
+  $('#ch-toggle').onclick = () => {
+    enabled = !enabled;
+    $('#ch-toggle').textContent = enabled ? 'BẬT' : 'TẮT';
+    $('#ch-toggle').style.background = enabled ? '#3a3' : '#c33';
+    if (enabled) {
+      initEngine(); lastFen = ''; schedule();
+    } else { clearArrow(); info('Đã tắt'); }
+  };
+  $('#ch-depth').oninput = (e) => { depth = +e.target.value; $('#ch-dv').textContent = depth; lastFen = ''; schedule(); };
+  $('#ch-multi').oninput = (e) => {
+    multiPV = +e.target.value; $('#ch-mv').textContent = multiPV;
+    if (ready) engine.postMessage('setoption name MultiPV value ' + multiPV);
+    lastFen = ''; schedule();
+  };
+
+  // ---------- Engine ----------
+  function initEngine() {
+    if (engine) return;
+    info('Đang tải Stockfish...');
+    GM_xmlhttpRequest({
+      method: 'GET', url: SF_URL,
+      onload: (r) => {
+        try {
+          const blob = new Blob([r.responseText], { type: 'application/javascript' });
+          engine = new Worker(URL.createObjectURL(blob));
+          engine.onmessage = onEngine;
+          engine.postMessage('uci');
+        } catch (e) { info('Lỗi worker'); console.error(e); }
+      },
+      onerror: () => info('Không tải được Stockfish'),
+    });
+  }
+
+  function fmtScore(s) {
+    if (!s) return '–';
+    if (s.type === 'mate') return '#' + s.val;
+    const v = s.val / 100;
+    return (v > 0 ? '+' : '') + v.toFixed(2);
+  }
+
+  function renderLines() {
+    const keys = Object.keys(lines).sort();
+    if (!keys.length) return;
+    $('#ch-eval').textContent = fmtScore(lines[keys[0]].score);
+    $('#ch-lines').innerHTML = keys.map((k) => {
+      const l = lines[k];
+      return `<div><span style="color:${COLORS[k - 1]}">●</span> ${fmtScore(l.score)} ${l.pv.slice(0, 4).join(' ')}</div>`;
+    }).join('');
+  }
+
+  function onEngine(e) {
+    const m = typeof e.data === 'string' ? e.data : '';
+    if (m === 'uciok') {
+      engine.postMessage('setoption name Hash value 64');
+      engine.postMessage('setoption name MultiPV value ' + multiPV);
+      engine.postMessage('isready');
+    } else if (m === 'readyok') {
+      if (!ready) { ready = true; info('Engine sẵn sàng'); schedule(); }
+    } else if (m.startsWith('info') && m.includes(' pv ')) {
+      if (pending > 1) return; // bỏ qua kết quả của lượt tìm cũ
+      const mp = +((m.match(/multipv (\d+)/) || [])[1] || 1);
+      const sc = m.match(/score (cp|mate) (-?\d+)/);
+      const pv = m.split(' pv ')[1].trim().split(' ');
+      const d = +((m.match(/depth (\d+)/) || [])[1] || 0);
+      if (!sc) return;
+      lines[mp] = { score: { type: sc[1], val: +sc[2] }, pv, depth: d };
+      renderLines();
+    } else if (m.startsWith('bestmove')) {
+      pending = Math.max(0, pending - 1);
+      if (pending > 0) return;
+      drawArrows();
+    }
+  }
+
+  // ---------- Đọc bàn cờ ----------
+  const getBoard = () => document.querySelector('wc-chess-board, chess-board');
+
+  function readPosition() {
+    const board = getBoard();
+    if (!board) return null;
+    const grid = Array.from({ length: 8 }, () => Array(8).fill(null));
+    board.querySelectorAll('.piece').forEach((p) => {
+      const cls = [...p.classList];
+      const t = cls.find((c) => /^[wb][pnbrqk]$/.test(c));
+      const s = cls.find((c) => /^square-\d\d$/.test(c));
+      if (!t || !s) return;
+      const file = +s[7] - 1, rank = +s[8] - 1;
+      grid[rank][file] = t[0] === 'w' ? t[1].toUpperCase() : t[1];
+    });
+
+    const flipped = board.classList.contains('flipped');
+    const myColor = flipped ? 'b' : 'w';
+
+    // Nước đi cuối -> xác định lượt đi + en passant
+    const hl = [...board.querySelectorAll('.highlight')]
+      .map((h) => [...h.classList].find((c) => /^square-\d\d$/.test(c)))
+      .filter(Boolean)
+      .map((s) => ({ f: +s[7] - 1, r: +s[8] - 1 }));
+
+    let turn = 'w', ep = '-';
+    const dest = hl.find((h) => grid[h.r][h.f]);
+    if (dest) {
+      const pc = grid[dest.r][dest.f];
+      turn = pc === pc.toUpperCase() ? 'b' : 'w';
+      const src = hl.find((h) => h !== dest);
+      if (src && (pc === 'P' || pc === 'p') && src.f === dest.f && Math.abs(src.r - dest.r) === 2) {
+        ep = String.fromCharCode(97 + dest.f) + ((src.r + dest.r) / 2 + 1);
+      }
+    }
+
+    const rows = [];
+    for (let r = 7; r >= 0; r--) {
+      let row = '', empty = 0;
+      for (let f = 0; f < 8; f++) {
+        const pc = grid[r][f];
+        if (!pc) empty++;
+        else { if (empty) { row += empty; empty = 0; } row += pc; }
+      }
+      if (empty) row += empty;
+      rows.push(row);
+    }
+
+    let castle = '';
+    if (grid[0][4] === 'K') { if (grid[0][7] === 'R') castle += 'K'; if (grid[0][0] === 'R') castle += 'Q'; }
+    if (grid[7][4] === 'k') { if (grid[7][7] === 'r') castle += 'k'; if (grid[7][0] === 'r') castle += 'q'; }
+
+    const fen = `${rows.join('/')} ${turn} ${castle || '-'} ${ep} 0 1`;
+    return { fen, turn, myColor };
+  }
+
+  // ---------- Vòng lặp phân tích ----------
+  function schedule() { clearTimeout(timer); timer = setTimeout(analyze, 300); }
+
+  function analyze() {
+    if (!enabled || !ready) return;
+    const pos = readPosition();
+    if (!pos) return info('Không thấy bàn cờ');
+    if (pos.fen === lastFen) return;
+    lastFen = pos.fen;
+    clearArrow();
+    lines = {};
+    info('Đang tính...');
+    if (pending > 0) engine.postMessage('stop');
+    pending++;
+    engine.postMessage('position fen ' + pos.fen);
+    engine.postMessage('go depth ' + depth);
+  }
+
+  new MutationObserver((muts) => {
+    if (!enabled) return;
+    const relevant = muts.some((m) => {
+      const t = m.target;
+      return !panel.contains(t) && !(t.closest && t.closest('.ch-arrow'));
+    });
+    if (relevant) schedule();
+  }).observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] });
+
+  // ---------- Vẽ mũi tên ----------
+  function clearArrow() { document.querySelectorAll('.ch-arrow').forEach((n) => n.remove()); }
+
+  function drawArrows() {
+    clearArrow();
+    const board = getBoard();
+    if (!board) return;
+    const keys = Object.keys(lines).sort();
+    if (!keys.length) return;
+    const flipped = board.classList.contains('flipped');
+    const pt = (sq) => {
+      const f = sq.charCodeAt(0) - 97, r = +sq[1] - 1;
+      return [(flipped ? 7 - f : f) * 100 + 50, (flipped ? r : 7 - r) * 100 + 50];
+    };
+
+    let body = '', defs = '';
+    // vẽ nước yếu hơn trước để nước tốt nhất nằm trên cùng
+    [...keys].reverse().forEach((k) => {
+      const mv = lines[k].pv[0];
+      if (!mv || mv.length < 4) return;
+      const c = COLORS[k - 1];
+      const w = k === '1' ? 16 : 10;
+      const op = k === '1' ? 0.85 : 0.55;
+      const [x1, y1] = pt(mv.slice(0, 2)), [x2, y2] = pt(mv.slice(2, 4));
+      // rút ngắn đầu mũi tên để không che quân
+      const dx = x2 - x1, dy = y2 - y1, len = Math.hypot(dx, dy) || 1;
+      const sx = x2 - (dx / len) * 28, sy = y2 - (dy / len) * 28;
+      defs += `<marker id="chh${k}" markerWidth="4" markerHeight="4" refX="2" refY="2" orient="auto"><path d="M0,0 L4,2 L0,4 Z" fill="${c}"/></marker>`;
+      body += `<line x1="${x1}" y1="${y1}" x2="${sx}" y2="${sy}" stroke="${c}" stroke-width="${w}" stroke-opacity="${op}" marker-end="url(#chh${k})"/>
+               <circle cx="${x1}" cy="${y1}" r="${w - 2}" fill="${c}" fill-opacity="${op}"/>`;
+    });
+
+    const ns = 'http://www.w3.org/2000/svg';
+    const svg = document.createElementNS(ns, 'svg');
+    svg.setAttribute('class', 'ch-arrow');
+    svg.setAttribute('viewBox', '0 0 800 800');
+    svg.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;pointer-events:none;z-index:50;';
+    svg.innerHTML = `<defs>${defs}</defs>${body}`;
+    if (getComputedStyle(board).position === 'static') board.style.position = 'relative';
+    board.appendChild(svg);
+    info('Gợi ý: ' + lines[keys[0]].pv[0] + ' (d' + lines[keys[0]].depth + ')');
+  }
+})();
